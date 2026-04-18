@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XR 极速扫描 (高质量三步版)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 0; background: #fff; display: flex; flex-direction: column; align-items: center; }
+        #container { position: relative; width: 100vw; height: 50vh; background: #000; overflow: hidden; }
+        video { display: none; }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+        .dashboard { width: 95%; max-width: 450px; padding: 20px; text-align: center; }
+        #instruction { font-size: 24px; font-weight: bold; color: #007bff; margin: 15px 0; height: 60px; display: flex; align-items: center; justify-content: center; }
+        .task-list { display: flex; justify-content: center; gap: 15px; margin-bottom: 25px; }
+        .task { width: 80px; font-size: 14px; opacity: 0.3; transition: 0.3s; padding: 10px; border: 1px solid #ddd; border-radius: 12px; }
+        .task.active { opacity: 1; border-color: #007bff; background: #e7f3ff; transform: scale(1.1); }
+        .task.done { opacity: 1; background: #d4edda; border-color: #28a745; color: #155724; }
+        button { width: 100%; padding: 20px; font-size: 20px; border-radius: 15px; border: none; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        #start_btn { background: #007bff; color: #fff; }
+        #start_btn:active { transform: scale(0.98); }
+        #view_btn { background: #28a745; color: #fff; display: none; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+    <div class="dashboard">
+        <div id="instruction">准备中...</div>
+        <div class="task-list">
+            <div class="task" id="t_front">1. 正脸</div>
+            <div class="task" id="t_up">2. 仰头</div>
+            <div class="task" id="t_down">3. 俯头</div>
+        </div>
+        <button id="start_btn" disabled>请稍候...</button>
+        <button id="view_btn">查看高质量 3D 模型</button>
+    </div>
+
+    <script type="module">
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const instruction = document.getElementById('instruction');
+        const startBtn = document.getElementById('start_btn');
+        const viewBtn = document.getElementById('view_btn');
+
+        let scanPhase = 'idle', poseStartTime = 0, faceData = null, cameraAspect = 1.0;
+        const LOCK_TIME = 1500; 
+        let textures = { front:null, up:null, down:null };
+
+        const phases = ['front', 'up', 'down'];
+        const phasePrompts = { front: "请正对屏幕", up: "请稍微仰头", down: "请稍微低头" };
+
+        function speak(t) {
+            window.speechSynthesis.cancel();
+            const m = new SpeechSynthesisUtterance(t);
+            m.lang = 'zh-CN';
+            window.speechSynthesis.speak(m);
+        }
+
+        const faceMesh = new FaceMesh({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+        faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+        function checkPoseMatch(landmarks, target) {
+            const nose = landmarks[1], top = landmarks[10], bot = landmarks[152], left = landmarks[234], right = landmarks[454];
+            const vRatio = (nose.y - top.y) / (bot.y - top.y);
+            const hRatio = (nose.x - left.x) / (right.x - left.x);
+            
+            if (target === 'up' && vRatio < 0.4) return true;
+            if (target === 'down' && vRatio > 0.6) return true;
+            if (target === 'front' && vRatio >= 0.4 && vRatio <= 0.6 && hRatio >= 0.4 && hRatio <= 0.6) return true;
+            return false;
+        }
+
+        faceMesh.onResults((res) => {
+            const w = videoElement.videoWidth, h = videoElement.videoHeight;
+            if (!w) return;
+            cameraAspect = h / w;
+            canvasElement.width = w; canvasElement.height = h;
+            canvasCtx.save();
+            canvasCtx.translate(w, 0); canvasCtx.scale(-1, 1);
+            canvasCtx.drawImage(res.image, 0, 0, w, h);
+            canvasCtx.restore();
+
+            if (res.multiFaceLandmarks && res.multiFaceLandmarks[0]) {
+                const face = res.multiFaceLandmarks[0];
+                if (scanPhase === 'idle') {
+                    startBtn.disabled = false; startBtn.innerText = "开始 3 步快扫";
+                    instruction.innerText = "准备好后点击下方按钮"; return;
+                }
+
+                if (phases.includes(scanPhase)) {
+                    if (checkPoseMatch(face, scanPhase)) {
+                        if (!poseStartTime) { poseStartTime = Date.now(); speak("保持住"); }
+                        const elapsed = Date.now() - poseStartTime;
+                        const remaining = Math.ceil((LOCK_TIME - elapsed) / 1000);
+                        
+                        if (remaining > 0) {
+                            instruction.style.color = "#28a745";
+                            instruction.innerText = `锁定中... ${remaining}`;
+                        } else {
+                            textures[scanPhase] = captureFrame(res, w, h);
+                            if (scanPhase === 'front') faceData = face.map(p => ({x:p.x, y:p.y, z:p.z}));
+                            document.getElementById('t_' + scanPhase).className = 'task done';
+                            
+                            const nextIdx = phases.indexOf(scanPhase) + 1;
+                            if (nextIdx < phases.length) {
+                                scanPhase = phases[nextIdx]; poseStartTime = 0;
+                                document.getElementById('t_' + scanPhase).className = 'task active';
+                                speak(phasePrompts[scanPhase]);
+                            } else {
+                                scanPhase = 'done'; speak("扫描完成"); 
+                                instruction.innerText = "扫描成功！";
+                                viewBtn.style.display = 'block';
+                            }
+                        }
+                    } else { poseStartTime = 0; instruction.style.color = "#007bff"; instruction.innerText = phasePrompts[scanPhase]; }
+                }
+            }
+        });
+
+        function captureFrame(res, w, h) {
+            const c = document.createElement('canvas'); c.width = w; c.height = h;
+            const ctx = c.getContext('2d');
+            ctx.translate(w, 0); ctx.scale(-1, 1);
+            ctx.drawImage(res.image, 0, 0, w, h);
+            return c.toDataURL('image/jpeg', 0.95);
+        }
+
+        const camera = new Camera(videoElement, { onFrame: async () => { await faceMesh.send({image: videoElement}); }, width: 1280, height: 720 });
+        camera.start();
+
+        startBtn.onclick = () => {
+            scanPhase = 'front'; startBtn.style.display = 'none';
+            document.getElementById('t_front').className = 'task active';
+            speak(phasePrompts.front);
+        };
+
+        viewBtn.onclick = () => {
+            sessionStorage.setItem('faceData', JSON.stringify(faceData));
+            sessionStorage.setItem('textures', JSON.stringify(textures));
+            sessionStorage.setItem('aspect', cameraAspect);
+            const win = window.open('', '_blank');
+            win.document.write(`
+                <html>
+                <head>
+                    <title>3D 模型预览</title>
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                    <script type="importmap">
+                        { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js", "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+                    <\/script>
+                    <script src="https://cdn.jsdelivr.net/npm/delaunator@5.0.0/delaunator.min.js"><\/script>
+                    <style>body { margin:0; background:#000; overflow:hidden; touch-action:none; } #ar-btn { position:absolute; bottom:20px; left:50%; transform:translateX(-50%); z-index:100; padding:12px 24px; background:#28a745; color:#fff; border:none; border-radius:8px; font-weight:bold; }<\/style>
+                </head>
+                <body>
+                    <div id="ui-layer"></div>
+                    <script type="module">
+                        import * as THREE from 'three';
+                        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+                        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+                        const data = JSON.parse(sessionStorage.getItem('faceData'));
+                        const texs = JSON.parse(sessionStorage.getItem('textures'));
+                        const aspect = parseFloat(sessionStorage.getItem('aspect'));
+
+                        const scene = new THREE.Scene();
+                        const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+                        const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+                        renderer.setSize(window.innerWidth, window.innerHeight);
+                        renderer.setPixelRatio(window.devicePixelRatio);
+                        renderer.xr.enabled = true;
+                        document.body.appendChild(renderer.domElement);
+
+                        const controls = new OrbitControls(camera, renderer.domElement);
+                        camera.position.set(0, 0, 2);
+
+                        const modelGroup = new THREE.Group();
+                        scene.add(modelGroup);
+
+                        const geo = new THREE.BufferGeometry();
+                        const pos = [], uv = [], pts2d = [];
+                        data.forEach(p => {
+                            pos.push((0.5-p.x)*3, (0.5-p.y)*3*aspect, -p.z*3);
+                            uv.push(1-p.x, 1-p.y); pts2d.push([p.x, p.y]);
+                        });
+                        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+                        geo.setIndex(new THREE.BufferAttribute(new Uint32Array(Delaunator.from(pts2d).triangles), 1));
+                        geo.computeVertexNormals();
+
+                        const loader = new THREE.TextureLoader();
+                        const material = new THREE.ShaderMaterial({
+                            uniforms: {
+                                tF: { value: loader.load(texs.front) },
+                                tU: { value: loader.load(texs.up) },
+                                tD: { value: loader.load(texs.down) }
+                            },
+                            vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+                            fragmentShader: "uniform sampler2D tF,tU,tD; varying vec2 vUv; void main() { vec4 f = texture2D(tF, vUv); vec4 u = texture2D(tU, vUv); vec4 d = texture2D(tD, vUv); float wU = smoothstep(0.65, 0.95, vUv.y); float wD = smoothstep(0.35, 0.05, vUv.y); vec4 res = mix(f, u, wU); res = mix(res, d, wD); gl_FragColor = res; }",
+                            side: THREE.DoubleSide
+                        });
+                        modelGroup.add(new THREE.Mesh(geo, material));
+
+                        scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+
+                        const arButton = ARButton.createButton(renderer, { requiredFeatures: ['local-floor'] });
+                        document.body.appendChild(arButton);
+
+                        let touchState = { initialScale: 1, initialDist: 0, initialMid: new THREE.Vector2(), initialPos: new THREE.Vector3(), lastPos: new THREE.Vector2() };
+                        
+                        window.addEventListener('touchstart', e => {
+                            if (!renderer.xr.isPresenting) return;
+                            if (e.touches.length === 1) touchState.lastPos.set(e.touches[0].pageX, e.touches[0].pageY);
+                            else if (e.touches.length === 2) {
+                                touchState.initialDist = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+                                touchState.initialScale = modelGroup.scale.x;
+                                touchState.initialMid.set((e.touches[0].pageX + e.touches[1].pageX)/2, (e.touches[0].pageY + e.touches[1].pageY)/2);
+                                touchState.initialPos.copy(modelGroup.position);
+                            }
+                        });
+
+                        window.addEventListener('touchmove', e => {
+                            if (!renderer.xr.isPresenting) return;
+                            if (e.touches.length === 1) {
+                                const dx = (e.touches[0].pageX - touchState.lastPos.x) * 0.01;
+                                const dy = (e.touches[0].pageY - touchState.lastPos.y) * 0.01;
+                                modelGroup.rotateOnWorldAxis(new THREE.Vector3(0,1,0), dx);
+                                modelGroup.rotateOnWorldAxis(new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0), dy);
+                                touchState.lastPos.set(e.touches[0].pageX, e.touches[0].pageY);
+                            } else if (e.touches.length === 2) {
+                                const dist = Math.hypot(e.touches[0].pageX - e.touches[1].pageX, e.touches[0].pageY - e.touches[1].pageY);
+                                modelGroup.scale.setScalar(touchState.initialScale * (dist / touchState.initialDist));
+                                const midX = (e.touches[0].pageX + e.touches[1].pageX)/2, midY = (e.touches[0].pageY + e.touches[1].pageY)/2;
+                                const sens = 0.002;
+                                const vRight = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
+                                const vUp = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
+                                modelGroup.position.copy(touchState.initialPos).addScaledVector(vRight, (midX - touchState.initialMid.x) * sens).addScaledVector(vUp, -(midY - touchState.initialMid.y) * sens);
+                            }
+                        });
+
+                        renderer.xr.addEventListener('sessionstart', () => { modelGroup.position.set(0, 0, -1); modelGroup.scale.setScalar(0.1); });
+
+                        renderer.setAnimationLoop(() => {
+                            if (!renderer.xr.isPresenting) controls.update();
+                            renderer.render(scene, camera);
+                        });
+                    <\/script>
+                </body></html>
+            `);
+            win.document.close();
+        };
+    </script>
+</body>
+</html>
